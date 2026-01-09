@@ -17,4 +17,8 @@ keras
 nltk
 openpyxl
 async_playwright
+numpy
+opencv-python
+playwright
+
 
