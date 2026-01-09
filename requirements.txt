@@ -15,3 +15,4 @@ statsmodels
 tensorflow
 keras
 nltk
+openpyxl
