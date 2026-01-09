@@ -16,3 +16,5 @@ tensorflow
 keras
 nltk
 openpyxl
+async_playwright
+
