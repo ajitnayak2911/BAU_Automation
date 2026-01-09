@@ -1,0 +1,17 @@
+streamlit
+requests
+certifi
+beautifulsoup4
+matplotlib
+wordcloud
+altair
+pandas
+textblob
+google-generativeai
+seaborn
+scipy
+scikit-learn
+statsmodels
+tensorflow
+keras
+nltk
