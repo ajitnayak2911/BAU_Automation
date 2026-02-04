@@ -4,20 +4,19 @@ import streamlit as st
 import pandas as pd
 import io
 
+# ✅ Must be the first Streamlit call
+st.set_page_config(page_title="Link Behavior Audit", layout="wide")
+
 from bs4 import BeautifulSoup
 from openpyxl.styles import PatternFill
-from selenium import webdriver
-from selenium.webdriver.chrome.options import Options
-from selenium.webdriver.chrome.service import Service
-from selenium.webdriver.common.by import By
-from selenium.webdriver.support.ui import WebDriverWait
-from selenium.webdriver.support import expected_conditions as EC
-from webdriver_manager.chrome import ChromeDriverManager
+from playwright.sync_api import sync_playwright
 
-# Special paths we classify as "External" even though same domain
+# -------------------------
+# Configuration
+# -------------------------
+
 SPECIAL_EXTERNAL_PATHS = ["/fr/", "/de/", "/jp/", "/next"]
 
-# Exclude entire sections by CSS selectors (limited to pure nav/footer/cookie banners)
 IGNORE_SELECTORS = [
     "footer#footer-section",
     "nav#main-nav",
@@ -29,87 +28,99 @@ IGNORE_SELECTORS = [
     "div.ot-pc-footer-logo",
     "a.ot-cookie-policy-link",
     "div.recaptcha-disclaimer",
-    "div.recaptcha-disclaimer.reducefont"
-    "a.skip-link[href='#main-content']"
+    "div.recaptcha-disclaimer.reducefont",
+    "a.skip-link[href='#main-content']",
 ]
 
-# Exclude specific href patterns (known boilerplate)
 IGNORE_HREF_PATTERNS = [
     "https://policies.google.com/privacy",
     "https://policies.google.com/terms",
-    "javascript:void(0)",         # copy-to-clipboard
-    "/contact-us"                 # Skip Contact Us link
+    "javascript:void(0)",
+    "/contact-us",
 ]
 
-# Social share domains
 SOCIAL_DOMAINS = ["twitter.com", "facebook.com", "linkedin.com"]
 
+# -------------------------
+# Helpers
+# -------------------------
 
-def analyze_links(page_url):
+def extract_basic_auth(url: str):
+    """
+    Supports:
+    https://username:password@www-dev.example.com
+    """
+    parsed = urlparse(url)
+
+    if parsed.username and parsed.password:
+        clean_url = parsed._replace(netloc=parsed.hostname).geturl()
+        return clean_url, parsed.username, parsed.password
+
+    return url, "", ""
+
+
+def check_link_status(url, timeout=10):
     try:
-        chrome_options = Options()
-        chrome_options.add_argument("--headless")
-        chrome_options.add_argument("--no-sandbox")
-        chrome_options.add_argument("--disable-dev-shm-usage")
+        response = requests.head(url, allow_redirects=True, timeout=timeout)
 
-        driver = webdriver.Chrome(options=chrome_options)
-        driver.get(page_url)
+        if response.status_code >= 400:
+            response = requests.get(url, allow_redirects=True, timeout=timeout)
 
-        # ✅ Explicit wait until at least one <a> appears
-        WebDriverWait(driver, 10).until(
-            EC.presence_of_all_elements_located((By.TAG_NAME, "a"))
-        )
+        code = response.status_code
 
-        # ✅ Get page source for BeautifulSoup cleanup
-        html = driver.page_source
-        driver.quit()
+        if 200 <= code < 300:
+            return code, "OK"
+        elif 300 <= code < 400:
+            return code, "Redirect"
+        elif 400 <= code < 500:
+            return code, "Client Error"
+        elif 500 <= code < 600:
+            return code, "Server Error"
+        else:
+            return code, "Unknown"
 
+    except Exception:
+        return "Error", "Unreachable"
+
+
+# -------------------------
+# Core Logic
+# -------------------------
+
+def analyze_links(page_url, username="", password=""):
+    try:
+        with sync_playwright() as p:
+            browser = p.chromium.launch(
+                headless=True,
+                args=["--no-sandbox", "--disable-dev-shm-usage"],
+            )
+
+            context = browser.new_context(
+                http_credentials={
+                    "username": username,
+                    "password": password,
+                }
+                if username and password
+                else None
+            )
+
+            page = context.new_page()
+            page.goto(page_url, wait_until="networkidle", timeout=30000)
+            page.wait_for_selector("a", timeout=10000)
+
+            html = page.content()
+
+            context.close()
+            browser.close()
 
     except Exception as e:
         return [], f"Error fetching page: {e}"
 
-
-    # ✅ Parse with BeautifulSoup
     soup = BeautifulSoup(html, "html.parser")
 
-    # Remove unwanted sections by configured selectors
     for selector in IGNORE_SELECTORS:
         for tag in soup.select(selector):
             tag.decompose()
-
-    # --- REMOVE FOOTER ---
-    #footer = soup.find("footer", id="footer-section")
-    #if footer: footer.decompose()
-
-    # --- REMOVE MAIN NAVIGATION ---
-    #nav = soup.find("nav", id="main-nav")
-    #if nav: nav.decompose()
-
-    # --- REMOVE PROMO BAR ---
-    #promo_bar = soup.find("div", class_="promo-bar")
-    #if promo_bar: promo_bar.decompose()
-
-    # --- REMOVE CONTACT US Phone Numbers ---
-    #contact_us_numbers = soup.find("div", class_="contact-us__bottom")
-    #if contact_us_numbers: contact_us_numbers.decompose()
-
-    # --- REMOVE COOKIE BANNER (OneTrust) ---
-    #cookie_banner = soup.find("div", class_="ot-sdk-row")
-    #if cookie_banner: cookie_banner.decompose()
-
-    #cookie_logo = soup.find("div", id="onetrust-consent-sdk")
-    #if cookie_logo: cookie_logo.decompose()
-
-    #cookie_group = soup.find("div", id="onetrust-group-container")
-    #if cookie_group: cookie_group.decompose()
-
-    # --- REMOVE OneTrust Footer Logo ---
-    #onetrust_logo = soup.find("div", class_="ot-pc-footer-logo")
-    #if onetrust_logo: onetrust_logo.decompose()
-
-    # --- REMOVE BREADCRUMBS ---
-    #breadcrumbs = soup.find("nav", class_="breadcrumbs") or soup.find("div", class_="breadcrumbs")
-    #if breadcrumbs: breadcrumbs.decompose()
 
     links = soup.find_all("a", href=True)
     base_domain = urlparse(page_url).netloc
@@ -121,154 +132,169 @@ def analyze_links(page_url):
         if not href:
             continue
 
-        # Skip tel/mailto and skip links
-        if (href.startswith("tel:") or
-                href.startswith("mailto:")or
-                href.startswith("#main-content")
-        ):
+        if href.startswith(("tel:", "mailto:", "#main-content")):
             continue
-        # Skip excluded hrefs
+
         if any(pattern in href for pattern in IGNORE_HREF_PATTERNS):
             continue
 
         absolute_url = urljoin(page_url, href)
         parsed_url = urlparse(absolute_url)
 
-        # Link text fallback
-        link_text = link.get_text(strip=True) or link.get("aria-label") or link.get("title") or absolute_url
+        link_text = (
+            link.get_text(strip=True)
+            or link.get("aria-label")
+            or link.get("title")
+            or absolute_url
+        )
 
-        # Internal vs External
         is_external = parsed_url.netloc and parsed_url.netloc != base_domain
         for sp in SPECIAL_EXTERNAL_PATHS:
             if parsed_url.path.startswith(sp) and parsed_url.netloc == base_domain:
                 is_external = True
                 break
 
-        # Default behaviour
         opens_in = "New Tab" if link.get("target") == "_blank" else "Same Tab"
 
-        # Social override
         if any(domain in href for domain in SOCIAL_DOMAINS):
             opens_in = "New Tab"
 
-        # Document detection
-        doc_extensions = (".pdf", ".doc", ".docx", ".xls", ".xlsx", ".csv", ".ppt", ".pptx")
+        doc_extensions = (
+            ".pdf",
+            ".doc",
+            ".docx",
+            ".xls",
+            ".xlsx",
+            ".csv",
+            ".ppt",
+            ".pptx",
+        )
         is_document = absolute_url.lower().endswith(doc_extensions)
 
-        # Expected rule + reason
         if is_document:
             is_external = True
             expected = "✔" if opens_in == "New Tab" else "✘"
-            reason = "Document: must open External in New Tab" if expected == "✔" else "Document opened wrong"
+            reason = (
+                "Document: must open External in New Tab"
+                if expected == "✔"
+                else "Document opened wrong"
+            )
         else:
-            expected = "✔" if (
-                    (is_external and opens_in == "New Tab")
-                    or (not is_external and opens_in == "Same Tab")
-            ) else "✘"
+            expected = (
+                "✔"
+                if (is_external and opens_in == "New Tab")
+                or (not is_external and opens_in == "Same Tab")
+                else "✘"
+            )
+
             if is_external:
                 reason = "External OK" if expected == "✔" else "External should open New Tab"
             else:
                 reason = "Internal OK" if expected == "✔" else "Internal should open Same Tab"
 
-        results.append({
-            "Link Text": link_text,
-            "Opens In": opens_in,
-            "Internal/External": "External" if is_external else "Internal",
-            "Expected?": expected,
-            "Reason": reason
-        })
+        status_code, link_health = check_link_status(absolute_url)
+
+        results.append(
+            {
+                "Link Text": link_text,
+                "Opens In": opens_in,
+                "Internal/External": "External" if is_external else "Internal",
+                "HTTP Status": status_code,
+                "Link Health": link_health,
+                "Expected?": expected,
+                "Reason": reason,
+            }
+        )
 
     return results, None
 
 
-# --- Streamlit UI ---
-st.set_page_config(page_title="Link Behavior Audit", layout="wide")
+# -------------------------
+# Streamlit UI
+# -------------------------
 
 st.title("🔍 Link Behavior Audit Tool")
-st.markdown("""
-    This app scans a webpage for all **links** and checks:
-    - Whether they open in **Same Tab** or **New Tab**
-    - Whether they are **Internal** or **External**
-    - Whether the behavior matches the **Expected Rule**
-       - Internal → Same Tab
-       - External → New Tab
-       - Documents (PDF/DOC/XLS/PPT) → Always External + New Tab
 
-    👉 Enter any website URL below:
-    """)
+st.markdown(
+    """
+This app scans a webpage for all **links** and checks:
+- Whether they open in **Same Tab** or **New Tab**
+- Whether they are **Internal** or **External**
+- Whether the behavior matches the **Expected Rule**
+- Whether the link is **reachable or broken** (HTTP status)
+
+**Rules**
+- Internal → Same Tab  
+- External → New Tab  
+- Documents → Always External + New Tab  
+- 4xx / 5xx → Broken links
+"""
+)
 
 url = st.text_input("Enter Website URL", "https://www.broadridge.com/")
 
+st.info(
+    "🔐 **DEV environment access**\n\n"
+    "If the page is protected by Basic Authentication, use:\n\n"
+    "`https://username:password@www-dev.broadridge.com`\n\n"
+    "For public or PROD URLs, use the normal URL."
+)
+
 if st.button("Run Audit"):
     with st.spinner("Analyzing links..."):
-        results, error = analyze_links(url)
+        clean_url, username, password = extract_basic_auth(url)
+        results, error = analyze_links(clean_url, username, password)
 
     if error:
         st.error(error)
+
     elif results:
         df = pd.DataFrame(results)
         st.success(f"Found {len(df)} links.")
 
         def highlight_row(row):
-            return ['background-color: #f8d7da' if row["Expected?"] == "✘" else
-                    'background-color: #d4edda' if row["Expected?"] == "✔" else ''] * len(row)
+            if row.get("Link Health") in ["Client Error", "Server Error", "Unreachable"]:
+                return ["background-color: #f8d7da"] * len(row)
+            elif row["Expected?"] == "✘":
+                return ["background-color: #fff3cd"] * len(row)
+            else:
+                return ["background-color: #d4edda"] * len(row)
 
-
-        # Ensure index is dropped
         df = df.reset_index(drop=True)
-
         styled_df = df.style.apply(highlight_row, axis=1)
 
-        # 🔸 hide index so it doesn't render Count column
         html_table = styled_df.hide(axis="index").to_html(escape=False)
 
-        # Render in Streamlit
         st.components.v1.html(
             f"""
             <div style="max-height:450px; overflow-y:auto; border:1px solid #ddd;">
-                <style>
-                    table {{
-                        border-collapse: collapse;
-                        width: 100%;
-                    }}
-                    thead th {{
-                        position: sticky;
-                        top: 0;
-                        background: #f1f1f1;
-                        z-index: 2;
-                    }}
-                    th, td {{
-                        padding: 6px 12px;
-                        border: 1px solid #ccc;
-                        text-align: left;
-                    }}
-                </style>
                 {html_table}
             </div>
             """,
             height=500,
-            scrolling=False
+            scrolling=False,
         )
-        # Excel export
+
         output = io.BytesIO()
         with pd.ExcelWriter(output, engine="openpyxl") as writer:
             df.to_excel(writer, index=False, sheet_name="AuditResults")
             ws = writer.sheets["AuditResults"]
-            for row in range(2, len(df) + 2):
-                expected_value = df.iloc[row - 2]["Expected?"]
+            for r in range(2, len(df) + 2):
+                expected_value = df.iloc[r - 2]["Expected?"]
                 fill = PatternFill(
                     start_color="D4EDDA" if expected_value == "✔" else "F8D7DA",
                     end_color="D4EDDA" if expected_value == "✔" else "F8D7DA",
-                    fill_type="solid"
+                    fill_type="solid",
                 )
-                for col in range(1, len(df.columns) + 1):
-                    ws.cell(row=row, column=col).fill = fill
+                for c in range(1, len(df.columns) + 1):
+                    ws.cell(row=r, column=c).fill = fill
 
         st.download_button(
             "⬇️ Download results as Excel",
             data=output.getvalue(),
             file_name="link_audit_results.xlsx",
-            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         )
+
     else:
         st.warning("No links found on this page.")
